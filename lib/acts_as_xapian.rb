@@ -30,6 +30,9 @@ module ActsAsXapian
     class NoXapianRubyBindingsError < StandardError
     end
 
+    def ActsAsXapian.db_path
+        @@db_path
+    end
     # XXX global class intializers here get loaded more than once, don't know why. Protect them.
     if not $acts_as_xapian_class_var_init 
         @@db = nil
@@ -41,9 +44,6 @@ module ActsAsXapian
     end
     def ActsAsXapian.db
         @@db
-    end
-    def ActsAsXapian.db_path
-        @@db_path
     end
     def ActsAsXapian.writable_db
         @@writable_db
@@ -63,9 +63,6 @@ module ActsAsXapian
     def ActsAsXapian.values_by_prefix
         @@values_by_prefix
     end
-    def ActsAsXapian.config
-      @@config
-    end
 
     ######################################################################
     # Initialisation
@@ -74,35 +71,19 @@ module ActsAsXapian
             # store class and options for use later, when we open the db in readable_init
             @@init_values.push([classname,options])
         end
-    end
 
-    # Reads the config file (if any) and sets up the path to the database we'll be using
-    def ActsAsXapian.prepare_environment
-      return unless @@db_path.nil?
+        # stop if we can't find out if we're in development/test/production
+        rails_env = (ENV['RAILS_ENV'] or RAILS_ENV)
+        raise "Set RAILS_ENV, so acts_as_xapian can find the right Xapian database" if not rails_env
 
-      # barf if we can't figure out the environment
-      environment = (ENV['RAILS_ENV'] or RAILS_ENV)
-      raise "Set RAILS_ENV, so acts_as_xapian can find the right Xapian database" if not environment
-
-      # check for a config file
-      config_file = RAILS_ROOT + "/config/xapian.yml"
-      @@config = File.exists?(config_file) ? YAML.load_file(config_file)[environment] : {}
-
-      # figure out where the DBs should go
-      if config['base_db_path']
-        db_parent_path = RAILS_ROOT + "/" + config['base_db_path']
-      else
+        # make the directory for the xapian databases to go in
         db_parent_path = File.join(File.dirname(__FILE__), '../xapiandbs/')
-      end
+        Dir.mkdir(db_parent_path) unless File.exists?(db_parent_path)
+        @@db_path = File.join(db_parent_path, rails_env) 
 
-      # make the directory for the xapian databases to go in
-      Dir.mkdir(db_parent_path) unless File.exists?(db_parent_path)
-
-      @@db_path = File.join(db_parent_path, environment) 
-
-      # make some things that don't depend on the db
-      # XXX this gets made once for each acts_as_xapian. Oh well.
-      @@stemmer = Xapian::Stem.new('english')
+        # make some things that don't depend on the db
+        # XXX this gets made once for each acts_as_xapian. Oh well.
+        @@stemmer = Xapian::Stem.new('english')
     end
 
     # Opens / reopens the db for reading
@@ -110,16 +91,8 @@ module ActsAsXapian
     # but db.reopen wasn't enough by itself, so just do everything it's easier.
     def ActsAsXapian.readable_init
         raise NoXapianRubyBindingsError.new("Xapian Ruby bindings not installed") unless ActsAsXapian.bindings_available
-        raise "acts_as_xapian hasn't been called in any models" if @@init_values.empty?
-        
-        # if DB is not nil, then we're already initialised, so don't do it again
-        # XXX we need to reopen the database each time, so Xapian gets changes to it.
-        # Hopefully in later version of Xapian it will autodetect this, and this can
-        # be commented back in again.
-        # return unless @@db.nil?
+        raise "acts_as_xapian hasn't been called in any models" unless @@db_path
 
-        prepare_environment
-        
         # basic Xapian objects
         begin
             @@db = Xapian::Database.new(@@db_path)
@@ -155,7 +128,7 @@ module ActsAsXapian
             @@query_parser.add_boolean_prefix("modelid", "I")
             if options[:terms]
               for term in options[:terms]
-                  raise "Use a single capital letter for term code" if not term[1].match(/^[A-Z]$/)
+                  raise "Use up to 3 single capital letters for term code" if not term[1].match(/^[A-Z]{1,3}$/)
                   raise "M and I are reserved for use as the model/id term" if term[1] == "M" or term[1] == "I"
                   raise "model and modelid are reserved for use as the model/id prefixes" if term[2] == "model" or term[2] == "modelid"
                   raise "Z is reserved for stemming terms" if term[1] == "Z"
@@ -197,12 +170,10 @@ module ActsAsXapian
 
     def ActsAsXapian.writable_init(suffix = "")
         raise NoXapianRubyBindingsError.new("Xapian Ruby bindings not installed") unless ActsAsXapian.bindings_available
-        raise "acts_as_xapian hasn't been called in any models" if @@init_values.empty?
 
-        # if DB is not nil, then we're already initialised, so don't do it again
-        return unless @@writable_db.nil?
-        
-        prepare_environment
+        # XXX called so db_path is made, shouldn't really be calling .init here
+        # as will make it remake stemmer etc. excessively often.
+        ActsAsXapian.init 
 
         new_path = @@db_path + suffix
         raise "writable_suffix/suffix inconsistency" if @@writable_suffix && @@writable_suffix != suffix
@@ -244,7 +215,7 @@ module ActsAsXapian
             raise "please specifiy maximum number of results to return with parameter :limit" if not limit
             limit = limit.to_i 
             sort_by_prefix = options[:sort_by_prefix] || nil
-            sort_by_ascending = options[:sort_by_ascending].nil? ? true : options[:sort_by_ascending]
+            sort_by_ascending = options[:sort_by_ascending] || true
             collapse_by_prefix = options[:collapse_by_prefix] || nil
 
             ActsAsXapian.enquire.query = self.query
@@ -457,13 +428,6 @@ module ActsAsXapian
     # make sure that each index update is definitely saved to disk before
     # logging in the database that it has been.
     def ActsAsXapian.update_index(flush = false, verbose = false)
-        # Before calling writable_init we have to make sure every model class has been initialized.
-        # i.e. has had its class code loaded, so acts_as_xapian has been called inside it, and
-        # we have the info from acts_as_xapian.
-        model_classes = ActsAsXapianJob.find_by_sql("select model from acts_as_xapian_jobs group by model").map {|a| a.model.constantize}
-        # If there are no models in the queue, then nothing to do
-        return if model_classes.size == 0
-
         ActsAsXapian.writable_init
 
         ids_to_refresh = ActsAsXapianJob.find(:all).map() { |i| i.id }
@@ -505,8 +469,6 @@ module ActsAsXapian
     def ActsAsXapian.rebuild_index(model_classes, verbose = false)
         raise "when rebuilding all, please call as first and only thing done in process / task" if not ActsAsXapian.writable_db.nil?
 
-        prepare_environment
-        
         # Delete any existing .new database, and open a new one
         new_path = ActsAsXapian.db_path + ".new"
         if File.exist?(new_path)
@@ -520,22 +482,14 @@ module ActsAsXapian
         # process is aborted and old database carries on being used. Perhaps do in
         # transaction and commit after rename below? Not sure if thenlocking is then bad
         # for live website running at same time.
-        
         ActsAsXapianJob.destroy_all 
-        batch_size = 1000
         for model_class in model_classes
-          model_class.transaction do
-            0.step(model_class.count, batch_size) do |i|
-              STDOUT.puts("ActsAsXapian: New batch. From #{i} to #{i + batch_size}") if verbose
-              models = model_class.find(:all, :limit => batch_size, :offset => i)
-              for model in models
+            models = model_class.find(:all)
+            for model in models
                 STDOUT.puts("ActsAsXapian.rebuild_index #{model_class} #{model.id}") if verbose
                 model.xapian_index
-              end
             end
-          end
         end
-        
         ActsAsXapian.writable_db.flush
 
         # Rename into place
@@ -573,13 +527,7 @@ module ActsAsXapian
         def xapian_value(field, type = nil)
             value = self[field] || self.send(field.to_sym)
             if type == :date
-                if value.kind_of?(Time)
-                    value.utc.strftime("%Y%m%d")
-                elsif value.kind_of?(Date)
-                    value.to_time.utc.strftime("%Y%m%d")
-                else
-                    raise "Only Time or Date types supported by acts_as_xapian for :date fields, got " + value.class.to_s
-                end
+                value.utc.strftime("%Y%m%d")
             elsif type == :boolean
                 value ? true : false
             else
