@@ -30,9 +30,6 @@ module ActsAsXapian
     class NoXapianRubyBindingsError < StandardError
     end
 
-    def ActsAsXapian.db_path
-        @@db_path
-    end
     # XXX global class intializers here get loaded more than once, don't know why. Protect them.
     if not $acts_as_xapian_class_var_init 
         @@db = nil
@@ -44,6 +41,9 @@ module ActsAsXapian
     end
     def ActsAsXapian.db
         @@db
+    end
+    def ActsAsXapian.db_path
+        @@db_path
     end
     def ActsAsXapian.writable_db
         @@writable_db
@@ -63,6 +63,9 @@ module ActsAsXapian
     def ActsAsXapian.values_by_prefix
         @@values_by_prefix
     end
+    def ActsAsXapian.config
+      @@config
+    end
 
     ######################################################################
     # Initialisation
@@ -71,19 +74,35 @@ module ActsAsXapian
             # store class and options for use later, when we open the db in readable_init
             @@init_values.push([classname,options])
         end
+    end
 
-        # stop if we can't find out if we're in development/test/production
-        rails_env = (ENV['RAILS_ENV'] or RAILS_ENV)
-        raise "Set RAILS_ENV, so acts_as_xapian can find the right Xapian database" if not rails_env
+    # Reads the config file (if any) and sets up the path to the database we'll be using
+    def ActsAsXapian.prepare_environment
+      return unless @@db_path.nil?
 
-        # make the directory for the xapian databases to go in
+      # barf if we can't figure out the environment
+      environment = (ENV['RAILS_ENV'] or RAILS_ENV)
+      raise "Set RAILS_ENV, so acts_as_xapian can find the right Xapian database" if not environment
+
+      # check for a config file
+      config_file = RAILS_ROOT + "/config/xapian.yml"
+      @@config = File.exists?(config_file) ? YAML.load_file(config_file)[environment] : {}
+
+      # figure out where the DBs should go
+      if config['base_db_path']
+        db_parent_path = RAILS_ROOT + "/" + config['base_db_path']
+      else
         db_parent_path = File.join(File.dirname(__FILE__), '../xapiandbs/')
-        Dir.mkdir(db_parent_path) unless File.exists?(db_parent_path)
-        @@db_path = File.join(db_parent_path, rails_env) 
+      end
 
-        # make some things that don't depend on the db
-        # XXX this gets made once for each acts_as_xapian. Oh well.
-        @@stemmer = Xapian::Stem.new('english')
+      # make the directory for the xapian databases to go in
+      Dir.mkdir(db_parent_path) unless File.exists?(db_parent_path)
+
+      @@db_path = File.join(db_parent_path, environment) 
+
+      # make some things that don't depend on the db
+      # XXX this gets made once for each acts_as_xapian. Oh well.
+      @@stemmer = Xapian::Stem.new('english')
     end
 
     # Opens / reopens the db for reading
@@ -91,8 +110,16 @@ module ActsAsXapian
     # but db.reopen wasn't enough by itself, so just do everything it's easier.
     def ActsAsXapian.readable_init
         raise NoXapianRubyBindingsError.new("Xapian Ruby bindings not installed") unless ActsAsXapian.bindings_available
-        raise "acts_as_xapian hasn't been called in any models" unless @@db_path
+        raise "acts_as_xapian hasn't been called in any models" if @@init_values.empty?
+        
+        # if DB is not nil, then we're already initialised, so don't do it again
+        # XXX we need to reopen the database each time, so Xapian gets changes to it.
+        # Hopefully in later version of Xapian it will autodetect this, and this can
+        # be commented back in again.
+        # return unless @@db.nil?
 
+        prepare_environment
+        
         # basic Xapian objects
         begin
             @@db = Xapian::Database.new(@@db_path)
@@ -127,7 +154,7 @@ module ActsAsXapian
             @@query_parser.add_boolean_prefix("model", "M")
             @@query_parser.add_boolean_prefix("modelid", "I")
             if options[:terms]
-              for term in options[:terms]
+              for term in options[:terms]         
                   raise "Use up to 3 single capital letters for term code" if not term[1].match(/^[A-Z]{1,3}$/)
                   raise "M and I are reserved for use as the model/id term" if term[1] == "M" or term[1] == "I"
                   raise "model and modelid are reserved for use as the model/id prefixes" if term[2] == "model" or term[2] == "modelid"
@@ -170,10 +197,12 @@ module ActsAsXapian
 
     def ActsAsXapian.writable_init(suffix = "")
         raise NoXapianRubyBindingsError.new("Xapian Ruby bindings not installed") unless ActsAsXapian.bindings_available
+        raise "acts_as_xapian hasn't been called in any models" if @@init_values.empty?
 
-        # XXX called so db_path is made, shouldn't really be calling .init here
-        # as will make it remake stemmer etc. excessively often.
-        ActsAsXapian.init 
+        # if DB is not nil, then we're already initialised, so don't do it again
+        return unless @@writable_db.nil?
+        
+        prepare_environment
 
         new_path = @@db_path + suffix
         raise "writable_suffix/suffix inconsistency" if @@writable_suffix && @@writable_suffix != suffix
@@ -198,8 +227,12 @@ module ActsAsXapian
         attr_accessor :query
         attr_accessor :matches
         attr_accessor :query_models
+        attr_accessor :runtime
+        attr_accessor :cached_results
 
         def initialize_db
+            self.runtime = 0.0
+
             ActsAsXapian.readable_init
             if ActsAsXapian.db.nil?
                 raise "ActsAsXapian not initialized"
@@ -210,38 +243,57 @@ module ActsAsXapian
         def initialize_query(options)
             #raise options.to_yaml
             
-            offset = options[:offset] || 0; offset = offset.to_i
-            limit = options[:limit]
-            raise "please specifiy maximum number of results to return with parameter :limit" if not limit
-            limit = limit.to_i 
-            sort_by_prefix = options[:sort_by_prefix] || nil
-            sort_by_ascending = options[:sort_by_ascending] || true
-            collapse_by_prefix = options[:collapse_by_prefix] || nil
+            self.runtime += Benchmark::realtime {
+                offset = options[:offset] || 0; offset = offset.to_i
+                limit = options[:limit]
+                raise "please specifiy maximum number of results to return with parameter :limit" if not limit
+                limit = limit.to_i 
+                sort_by_prefix = options[:sort_by_prefix] || nil
+                sort_by_ascending = options[:sort_by_ascending].nil? ? true : options[:sort_by_ascending]
+                collapse_by_prefix = options[:collapse_by_prefix] || nil
 
-            ActsAsXapian.enquire.query = self.query
+                ActsAsXapian.enquire.query = self.query
 
-            if sort_by_prefix.nil?
-                ActsAsXapian.enquire.sort_by_relevance!
-            else
-                value = ActsAsXapian.values_by_prefix[sort_by_prefix]
-                raise "couldn't find prefix '" + sort_by_prefix + "'" if value.nil?
-                ActsAsXapian.enquire.sort_by_value_then_relevance!(value, sort_by_ascending)
-            end
-            if collapse_by_prefix.nil?
-                ActsAsXapian.enquire.collapse_key = Xapian.BAD_VALUENO
-            else
-                value = ActsAsXapian.values_by_prefix[collapse_by_prefix]
-                raise "couldn't find prefix '" + collapse_by_prefix + "'" if value.nil?
-                ActsAsXapian.enquire.collapse_key = value
-            end
+                if sort_by_prefix.nil?
+                    ActsAsXapian.enquire.sort_by_relevance!
+                else
+                    value = ActsAsXapian.values_by_prefix[sort_by_prefix]
+                    raise "couldn't find prefix '" + sort_by_prefix + "'" if value.nil?
+                    ActsAsXapian.enquire.sort_by_value_then_relevance!(value, sort_by_ascending)
+                end
+                if collapse_by_prefix.nil?
+                    ActsAsXapian.enquire.collapse_key = Xapian.BAD_VALUENO
+                else
+                    value = ActsAsXapian.values_by_prefix[collapse_by_prefix]
+                    raise "couldn't find prefix '" + collapse_by_prefix + "'" if value.nil?
+                    ActsAsXapian.enquire.collapse_key = value
+                end
 
-            self.matches = ActsAsXapian.enquire.mset(offset, limit, 100)
-            @cached_results = nil
+                self.matches = ActsAsXapian.enquire.mset(offset, limit, 100)
+                self.cached_results = nil
+            }
         end
 
         # Return a description of the query
         def description
             self.query.description
+        end
+
+        # Does the query have non-prefixed search terms in it?
+        def has_normal_search_terms?
+            ret = false
+            #x = ''
+            for t in self.query.terms
+                term = t.term
+                #x = x + term.to_yaml + term.size.to_s + term[0..0] + "*"
+                if term.size >= 2 && term[0..0] == 'Z' 
+                    # normal terms begin Z (for stemmed), then have no capital letter prefix
+                    if term[1..1] == term[1..1].downcase
+                        ret = true
+                    end
+                end
+            end
+            return ret
         end
 
         # Estimate total number of results
@@ -261,19 +313,26 @@ module ActsAsXapian
         # Return array of models found
         def results
             # If they've already pulled out the results, just return them.
-            if not @cached_results.nil?
-                return @cached_results
+            if !self.cached_results.nil?
+                return self.cached_results
             end
 
-            # Pull out all the results
             docs = []
-            iter = self.matches._begin
-            while not iter.equals(self.matches._end)
-                docs.push({:data => iter.document.data, 
-                        :percent => iter.percent, 
-                        :weight => iter.weight,
-                        :collapse_count => iter.collapse_count})
-                iter.next
+            self.runtime += Benchmark::realtime {
+                # Pull out all the results
+                iter = self.matches._begin
+                while not iter.equals(self.matches._end)
+                    docs.push({:data => iter.document.data, 
+                            :percent => iter.percent, 
+                            :weight => iter.weight,
+                            :collapse_count => iter.collapse_count})
+                    iter.next
+                end
+            }
+
+            # Log time taken, excluding database lookups below which will be displayed separately by ActiveRecord
+            if ActiveRecord::Base.logger
+                ActiveRecord::Base.logger.add(Logger::DEBUG, "  Xapian query (#{'%.5fs' % self.runtime}) #{self.log_description}")
             end
 
             # Look up without too many SQL queries
@@ -296,7 +355,7 @@ module ActsAsXapian
             results = []
             docs.each{|doc| k = doc[:data].split('-'); results << { :model => chash[[k[0], k[1].to_i]],
                     :percent => doc[:percent], :weight => doc[:weight], :collapse_count => doc[:collapse_count] } }
-            @cached_results = results
+            self.cached_results = results
             return results
         end
     end
@@ -358,6 +417,11 @@ module ActsAsXapian
             return words
         end
 
+        # Text for lines in log file
+        def log_description
+            "Search: " + self.query_string
+        end
+
     end
 
     # Search for models which contain theimportant terms taken from a specified
@@ -372,45 +436,52 @@ module ActsAsXapian
         def initialize(model_classes, query_models, options = {})
             self.initialize_db
 
-            # Case of an array, searching for models similar to those models in the array
-            self.query_models = query_models
+            self.runtime += Benchmark::realtime {
+                # Case of an array, searching for models similar to those models in the array
+                self.query_models = query_models
 
-            # Find the documents by their unique term
-            input_models_query = Xapian::Query.new(Xapian::Query::OP_OR, query_models.map{|m| "I" + m.xapian_document_term})
-            ActsAsXapian.enquire.query = input_models_query
-            matches = ActsAsXapian.enquire.mset(0, 100, 100) # XXX so this whole method will only work with 100 docs
+                # Find the documents by their unique term
+                input_models_query = Xapian::Query.new(Xapian::Query::OP_OR, query_models.map{|m| "I" + m.xapian_document_term})
+                ActsAsXapian.enquire.query = input_models_query
+                matches = ActsAsXapian.enquire.mset(0, 100, 100) # XXX so this whole method will only work with 100 docs
 
-            # Get set of relevant terms for those documents
-            selection = Xapian::RSet.new()
-            iter = matches._begin
-            while not iter.equals(matches._end)
-                selection.add_document(iter)
-                iter.next
-            end
+                # Get set of relevant terms for those documents
+                selection = Xapian::RSet.new()
+                iter = matches._begin
+                while not iter.equals(matches._end)
+                    selection.add_document(iter)
+                    iter.next
+                end
 
-            # Bit weird that the function to make esets is part of the enquire
-            # object. This explains what exactly it does, which is to exclude
-            # terms in the existing query.
-            # http://thread.gmane.org/gmane.comp.search.xapian.general/3673/focus=3681
-            eset = ActsAsXapian.enquire.eset(40, selection) 
+                # Bit weird that the function to make esets is part of the enquire
+                # object. This explains what exactly it does, which is to exclude
+                # terms in the existing query.
+                # http://thread.gmane.org/gmane.comp.search.xapian.general/3673/focus=3681
+                eset = ActsAsXapian.enquire.eset(40, selection) 
 
-            # Do main search for them
-            self.important_terms = []
-            iter = eset._begin
-            while not iter.equals(eset._end)
-                self.important_terms.push(iter.term)
-                iter.next
-            end
-            similar_query = Xapian::Query.new(Xapian::Query::OP_OR, self.important_terms)
-            # Exclude original
-            combined_query = Xapian::Query.new(Xapian::Query::OP_AND_NOT, similar_query, input_models_query)
+                # Do main search for them
+                self.important_terms = []
+                iter = eset._begin
+                while not iter.equals(eset._end)
+                    self.important_terms.push(iter.term)
+                    iter.next
+                end
+                similar_query = Xapian::Query.new(Xapian::Query::OP_OR, self.important_terms)
+                # Exclude original
+                combined_query = Xapian::Query.new(Xapian::Query::OP_AND_NOT, similar_query, input_models_query)
 
-            # Restrain to model classes
-            model_query = Xapian::Query.new(Xapian::Query::OP_OR, model_classes.map{|mc| "M" + mc.to_s})
-            self.query = Xapian::Query.new(Xapian::Query::OP_AND, model_query, combined_query)
+                # Restrain to model classes
+                model_query = Xapian::Query.new(Xapian::Query::OP_OR, model_classes.map{|mc| "M" + mc.to_s})
+                self.query = Xapian::Query.new(Xapian::Query::OP_AND, model_query, combined_query)
+            }
 
             # Call base class constructor
             self.initialize_query(options)
+        end
+
+        # Text for lines in log file
+        def log_description
+            "Similar: " + self.query_models.to_s
         end
     end
 
@@ -428,25 +499,49 @@ module ActsAsXapian
     # make sure that each index update is definitely saved to disk before
     # logging in the database that it has been.
     def ActsAsXapian.update_index(flush = false, verbose = false)
+        # STDOUT.puts("start of ActsAsXapian.update_index") if verbose
+
+        # Before calling writable_init we have to make sure every model class has been initialized.
+        # i.e. has had its class code loaded, so acts_as_xapian has been called inside it, and
+        # we have the info from acts_as_xapian.
+        model_classes = ActsAsXapianJob.find_by_sql("select model from acts_as_xapian_jobs group by model").map {|a| a.model.constantize}
+        # If there are no models in the queue, then nothing to do
+        return if model_classes.size == 0
+
         ActsAsXapian.writable_init
 
         ids_to_refresh = ActsAsXapianJob.find(:all).map() { |i| i.id }
         for id in ids_to_refresh
             begin
                 ActiveRecord::Base.transaction do
-                    job = ActsAsXapianJob.find(id, :lock =>true)
+                    begin
+                        job = ActsAsXapianJob.find(id, :lock =>true)
+                    rescue ActiveRecord::RecordNotFound => e
+                        # This could happen if while we are working the model
+                        # was updated a second time by another process. In that case
+                        # ActsAsXapianJob.delete_all in xapian_mark_needs_index below
+                        # might have removed the first job record while we are working on it.
+                        STDOUT.puts("job with #{id} vanished under foot") if verbose
+                        next
+                    end
                     STDOUT.puts("ActsAsXapian.update_index #{job.action} #{job.model} #{job.model_id.to_s}") if verbose
-                    if job.action == 'update'
-                        # XXX Index functions may reference other models, so we could eager load here too?
-                        model = job.model.constantize.find(job.model_id) # :include => cls.constantize.xapian_options[:include]
-                        model.xapian_index
-                    elsif job.action == 'destroy'
-                        # Make dummy model with right id, just for destruction
-                        model = job.model.constantize.new
-                        model.id = job.model_id
-                        model.xapian_destroy
-                    else
-                        raise "unknown ActsAsXapianJob action '" + job.action + "'"
+                    begin
+                        if job.action == 'update'
+                            # XXX Index functions may reference other models, so we could eager load here too?
+                            model = job.model.constantize.find(job.model_id) # :include => cls.constantize.xapian_options[:include]
+                            model.xapian_index
+                        elsif job.action == 'destroy'
+                            # Make dummy model with right id, just for destruction
+                            model = job.model.constantize.new
+                            model.id = job.model_id
+                            model.xapian_destroy
+                        else
+                            raise "unknown ActsAsXapianJob action '" + job.action + "'"
+                        end
+                    rescue ActiveRecord::RecordNotFound => e
+                        # this can happen if the record was hand deleted in the database
+                        job.action = 'destroy'
+                        retry
                     end
                     job.destroy
 
@@ -469,6 +564,8 @@ module ActsAsXapian
     def ActsAsXapian.rebuild_index(model_classes, verbose = false)
         raise "when rebuilding all, please call as first and only thing done in process / task" if not ActsAsXapian.writable_db.nil?
 
+        prepare_environment
+        
         # Delete any existing .new database, and open a new one
         new_path = ActsAsXapian.db_path + ".new"
         if File.exist?(new_path)
@@ -482,14 +579,22 @@ module ActsAsXapian
         # process is aborted and old database carries on being used. Perhaps do in
         # transaction and commit after rename below? Not sure if thenlocking is then bad
         # for live website running at same time.
+        
         ActsAsXapianJob.destroy_all 
+        batch_size = 1000
         for model_class in model_classes
-            models = model_class.find(:all)
-            for model in models
+          model_class.transaction do
+            0.step(model_class.count, batch_size) do |i|
+              STDOUT.puts("ActsAsXapian: New batch. From #{i} to #{i + batch_size}") if verbose
+              models = model_class.find(:all, :limit => batch_size, :offset => i, :order => :id)
+              for model in models
                 STDOUT.puts("ActsAsXapian.rebuild_index #{model_class} #{model.id}") if verbose
                 model.xapian_index
+              end
             end
+          end
         end
+        
         ActsAsXapian.writable_db.flush
 
         # Rename into place
@@ -527,7 +632,13 @@ module ActsAsXapian
         def xapian_value(field, type = nil)
             value = self[field] || self.send(field.to_sym)
             if type == :date
-                value.utc.strftime("%Y%m%d")
+                if value.kind_of?(Time)
+                    value.utc.strftime("%Y%m%d")
+                elsif value.kind_of?(Date)
+                    value.to_time.utc.strftime("%Y%m%d")
+                else
+                    raise "Only Time or Date types supported by acts_as_xapian for :date fields, got " + value.class.to_s
+                end
             elsif type == :boolean
                 value ? true : false
             else
